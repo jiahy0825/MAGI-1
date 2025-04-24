@@ -32,6 +32,7 @@ from inference.common import (
     print_per_rank,
     print_rank_0,
 )
+from inference.common.nvtx import instrument_nvtx
 from inference.infra.checkpoint import load_checkpoint
 from inference.infra.distributed import parallel_state as mpu
 from inference.infra.parallelism import cp_post_process, cp_pre_process, pp_scheduler
@@ -111,6 +112,7 @@ class VideoDiTModel(torch.nn.Module):
             pW=self.patch_size,
         ).contiguous()
 
+    @instrument_nvtx
     @torch.no_grad()
     def get_embedding_and_meta(self, x, t, y, caption_dropout_mask, xattn_mask, kv_range, **kwargs):
         """
@@ -260,6 +262,7 @@ class VideoDiTModel(torch.nn.Module):
 
         return (x, condition, condition_map, rope, y_xattn_flat, xattn_mask_for_cuda_graph, H, W, ardf_meta, cross_attn_params)
 
+    @instrument_nvtx
     @torch.no_grad()
     def forward_pre_process(
         self, x, t, y, caption_dropout_mask=None, xattn_mask=None, kv_range=None, **kwargs
@@ -338,6 +341,7 @@ class VideoDiTModel(torch.nn.Module):
 
         return (x, condition, condition_map, y_xattn_flat, rope, meta_args)
 
+    @instrument_nvtx
     @torch.no_grad()
     def forward_post_process(self, x, meta_args: ModelMetaArgs) -> torch.Tensor:
         x = x.float()
@@ -359,6 +363,7 @@ class VideoDiTModel(torch.nn.Module):
 
         return x
 
+    @instrument_nvtx
     @torch.no_grad()
     def forward(
         self,
@@ -498,6 +503,7 @@ class VideoDiTModel(torch.nn.Module):
         assert indices.min() >= 0 and indices.max() < len(prev_chunk_scale_s)
         return prev_chunk_scale_s[indices], text_scale_s[indices]
 
+    @instrument_nvtx
     def forward_dispatcher(self, x, timestep, y, mask, kv_range, inference_params, **kwargs):
         if self.runtime_config.cfg_number == 3:
             (out_cond_pre_and_text, out_cond_pre, out_uncond, denoise_width) = self.forward_3cfg(

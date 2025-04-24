@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gc
 import os
 import tempfile
 
@@ -382,6 +381,6 @@ def post_chunk_process(chunk: torch.Tensor, config: MagiConfig):
         tile_sample_min_length,
         parallel_group=mpu.get_tp_group(with_context_parallel=True),
     )
-    gc.collect()
-    torch.cuda.empty_cache()
+    # gc.collect()
+    # torch.cuda.empty_cache()
     return chunk

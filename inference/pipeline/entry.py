@@ -43,6 +43,8 @@ def main():
             print("Error: --image_path is required for i2v mode.")
             sys.exit(1)
         pipeline.run_image_to_video(prompt=args.prompt, image_path=args.image_path, output_path=args.output_path)
+        pipeline.run_image_to_video(prompt=args.prompt, image_path=args.image_path, output_path=args.output_path)
+        pipeline.run_image_to_video(prompt=args.prompt, image_path=args.image_path, output_path=args.output_path)
     elif args.mode == 'v2v':
         if not args.prefix_video_path:
             print("Error: --prefix_video_path is required for v2v mode.")

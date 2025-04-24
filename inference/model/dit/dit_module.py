@@ -35,6 +35,7 @@ from torch import Tensor
 from torch.nn import Parameter
 
 from inference.common import EngineConfig, InferenceParams, ModelConfig, ModelMetaArgs, PackedCrossAttnParams, divide
+from inference.common.nvtx import instrument_nvtx
 from inference.infra.distributed import parallel_state
 from inference.infra.parallelism import CSOHelper, UlyssesScheduler, cso_communication
 
@@ -161,6 +162,7 @@ class FinalLinear(nn.Module):
         super().__init__()
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * t_patch_size * out_channels, bias=False)
 
+    @instrument_nvtx
     def forward(self, x):
         x = self.linear(x)
         return x
@@ -185,6 +187,7 @@ class AdaModulateLayer(torch.nn.Module):
             )
         )
 
+    @instrument_nvtx
     def forward(self, c):
         c = self.act(c)
         return self.proj(c)
@@ -284,6 +287,7 @@ def range_mod_triton(x, c_mapping, gatings):
     return y
 
 
+@instrument_nvtx
 def bias_modulate_add(
     x: torch.Tensor, residual: torch.Tensor, condition_map: torch.Tensor, gate: torch.Tensor, post_norm: torch.nn.Module
 ):
@@ -347,36 +351,25 @@ class FusedLayerNorm(torch.nn.Module):
         self.weight = Parameter(torch.empty(*hidden_size, dtype=model_config.params_dtype))
         self.bias = Parameter(torch.empty(*hidden_size, dtype=model_config.params_dtype))
 
+    @instrument_nvtx
     def forward(self, input: Tensor) -> Tensor:
         weight = self.weight + 1 if self.zero_centered_gamma else self.weight
         return torch.nn.functional.layer_norm(input, self.hidden_size, weight, self.bias, self.eps)
 
 
+@instrument_nvtx
 def softcap(x: torch.Tensor, cap: int):
     return (cap * torch.tanh(x.float() / cap)).to(x.dtype)
 
 
+@instrument_nvtx
 def div_clamp_to(x: torch.Tensor, scale: torch.Tensor):
     fp8_min = torch.finfo(torch.float8_e4m3fn).min
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    prefix_shape = x.shape[:-1]
-    last_shape = x.shape[-1]
-    x = x.flatten().reshape(-1, last_shape)
-    # Split x into 256 MB parts to avoid big memory peak
-    part_size = 256 * 1024 * 1024 // last_shape
-    part_num = (x.shape[0] + part_size - 1) // part_size
-    return (
-        torch.cat(
-            [
-                torch.clamp(x[i * part_size : (i + 1) * part_size].float() / scale.float(), fp8_min, fp8_max).bfloat16()
-                for i in range(part_num)
-            ],
-            dim=0,
-        )
-        .to(torch.float8_e4m3fn)
-        .reshape(*prefix_shape, last_shape)
-        .contiguous()
-    )
+    x = x.float()
+    x.div_(scale.float())
+    torch.clamp_(x, fp8_min, fp8_max)
+    return x.to(torch.float8_e4m3fn)
 
 
 ##########################################################
@@ -404,18 +397,23 @@ class CustomLayerNormLinear(torch.nn.Module):
             else:
                 setattr(self, name, PerTensorQuantizedFp8Linear(input_size, output_size))
 
+    @instrument_nvtx
     def forward_ln(self, hidden_states):
         return self.layer_norm(hidden_states)
 
+    @instrument_nvtx
     def forward_q(self, hidden_states):
         return self.q(hidden_states)
 
+    @instrument_nvtx
     def forward_qx(self, hidden_states):
         return self.qx(hidden_states)
 
+    @instrument_nvtx
     def forward_k(self, hidden_states):
         return self.k(hidden_states)
 
+    @instrument_nvtx
     def forward_v(self, hidden_states):
         return self.v(hidden_states)
 
@@ -437,6 +435,7 @@ class PerTensorQuantizedFp8Linear(torch.nn.Module):
         self.weight_scale = Parameter(torch.empty(1, dtype=torch.float32))
         self.input_scale = Parameter(torch.empty(in_features, dtype=torch.float32))
 
+    @instrument_nvtx
     def forward(self, input: torch.Tensor):
         input = div_clamp_to(input, self.input_scale)
 
@@ -469,6 +468,7 @@ class PerChannelQuantizedFp8Linear(torch.nn.Module):
         self.input_scale = Parameter(torch.empty(1, dtype=torch.float32))
         self.smooth_scale = Parameter(torch.empty(1, in_features, dtype=torch.float32))
 
+    @instrument_nvtx
     def forward(self, x):
         x = div_clamp_to(x, self.smooth_scale.to(torch.float32))
 
@@ -534,6 +534,7 @@ class CustomMLP(torch.nn.Module):
             self.model_config.ffn_hidden_size, self.model_config.hidden_size, bias=False, dtype=self.model_config.params_dtype
         )
 
+    @instrument_nvtx
     def forward(self, hidden_states):
         hidden_states = self.layer_norm(hidden_states)
         hidden_states = self.linear_fc1(hidden_states)
@@ -883,6 +884,7 @@ class FullyParallelAttention(Attention):
             model_config=self.model_config, hidden_size=self.hidden_size_per_attention_head
         )
 
+    @instrument_nvtx
     def _full_adjust_key_and_value(
         self, inference_params: InferenceParams, key_and_value: torch.Tensor, meta_args: ModelMetaArgs
     ):
@@ -925,6 +927,7 @@ class FullyParallelAttention(Attention):
 
         return torch.cat([get_key_and_value, key_and_value], dim=0)
 
+    @instrument_nvtx
     def adjust_key_and_value_for_inference(
         self, key_and_value: torch.Tensor, inference_params: InferenceParams, meta_args: ModelMetaArgs
     ):
@@ -945,6 +948,7 @@ class FullyParallelAttention(Attention):
     # [sq, b, (hn hd)] -> [(sq b), hn, hd]
     # =====================
 
+    @instrument_nvtx
     def get_q(self, mixed_qqkv: torch.Tensor, cos_emb: torch.Tensor, sin_emb: torch.Tensor):
         query = self.linear_qkv.forward_q(mixed_qqkv)
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
@@ -961,7 +965,7 @@ class FullyParallelAttention(Attention):
     # Get Key for core attn
     # [sq, b, (hn hd)] -> [(sq b), hn, hd]
     # =====================
-
+    @instrument_nvtx
     def get_k(self, mixed_qqkv: torch.Tensor, cos_emb: torch.Tensor, sin_emb: torch.Tensor):
         key = self.linear_qkv.forward_k(mixed_qqkv)
         key = key.reshape(key.size(0), key.size(1), -1, self.hidden_size_per_attention_head)
@@ -978,11 +982,12 @@ class FullyParallelAttention(Attention):
     # Get Value for core attn
     # [sq, b, (hn hd)] -> [(sq b), hn, hd]
     # =====================
-
+    @instrument_nvtx
     def get_v(self, mixed_qqkv: torch.Tensor):
         value = self.linear_qkv.forward_v(mixed_qqkv)
         return rearrange(value, "sq b (hn hd) -> (sq b) hn hd", hd=self.hidden_size_per_attention_head).contiguous()
 
+    @instrument_nvtx
     def get_kv(self, mixed_qqkv: torch.Tensor, cos_emb: torch.Tensor, sin_emb: torch.Tensor):
         # Get KV together for better performance when encoutering cpu-bound, mainly used by cuda graph
         key = self.get_k(mixed_qqkv, cos_emb, sin_emb)
@@ -990,6 +995,7 @@ class FullyParallelAttention(Attention):
         # [(sq b), hn, hd] -> [(sq b), hn, 2 * hd]
         return torch.cat([key, value], dim=-1)
 
+    @instrument_nvtx
     def get_qkv(self, mixed_qqkv: torch.Tensor, cos_emb: torch.Tensor, sin_emb: torch.Tensor):
         # Get QKV together for better performance when encoutering cpu-bound, mainly used by cuda graph
         q = self.get_q(mixed_qqkv, cos_emb, sin_emb)
@@ -997,6 +1003,7 @@ class FullyParallelAttention(Attention):
         v = self.get_v(mixed_qqkv)
         return q, k, v
 
+    @instrument_nvtx
     def get_xqkv(self, mixed_qqkv: torch.Tensor, key_value_states: torch.Tensor):
         query_xattn = self.linear_qkv.forward_qx(mixed_qqkv)
         query_xattn = rearrange(query_xattn, "sq b (hn hd) -> (b sq) hn hd", hd=self.hidden_size_per_attention_head)
@@ -1015,6 +1022,7 @@ class FullyParallelAttention(Attention):
         key_xattn = self.k_layernorm_xattn(key_xattn)
         return query_xattn, key_xattn, value_xattn
 
+    @instrument_nvtx
     def core_attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, bs: int, meta_args: ModelMetaArgs):
         # (sq b) hn hd -> b sq hn hd
         query = query.reshape(-1, bs, query.shape[1], query.shape[2]).transpose(0, 1).contiguous()
@@ -1060,6 +1068,7 @@ class FullyParallelAttention(Attention):
             core_attn_out = torch.cat(core_attn_outs, dim=0)
         return core_attn_out
 
+    @instrument_nvtx
     def full_attention(self, bs: int, meta_args: ModelMetaArgs, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, i: int):
         # NOTE(lml): full_attention is used under cp_shuffle_overlap strategy. We further limit it to the case of bs=1, so that we do not need to pay attention to the arrangement of sq and bs dimensions.
         assert bs == 1
@@ -1090,6 +1099,7 @@ class FullyParallelAttention(Attention):
             ).flatten(0, 1)
         return o
 
+    @instrument_nvtx
     def cross_attention(
         self,
         mixed_qqkv: torch.Tensor,
@@ -1130,6 +1140,7 @@ class FullyParallelAttention(Attention):
         xattn_out = rearrange(xattn_out, "(b sq) hn hd -> sq b (hn hd)", b=batch_size).contiguous()
         return xattn_out
 
+    @instrument_nvtx
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1286,6 +1297,7 @@ class TransformerLayer(torch.nn.Module):
 
         return offset
 
+    @instrument_nvtx
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1312,6 +1324,7 @@ class TransformerLayer(torch.nn.Module):
 
         return hidden_states
 
+    @instrument_nvtx
     def attn_post_process(
         self,
         core_attn_out: torch.Tensor,
@@ -1324,6 +1337,7 @@ class TransformerLayer(torch.nn.Module):
         hidden_states = self.gating_and_mlp(hidden_states, residual, condition, condition_map)
         return hidden_states
 
+    @instrument_nvtx
     def attn_linear_proj(self, core_attn_out: torch.Tensor, cross_attn_out: torch.Tensor):
         # ============================================
         # attention post-process , output. [sq, b, h]
@@ -1340,6 +1354,7 @@ class TransformerLayer(torch.nn.Module):
 
         return attn_out
 
+    @instrument_nvtx
     def gating_and_mlp(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, condition: torch.Tensor, condition_map: torch.Tensor
     ):
@@ -1404,6 +1419,7 @@ class TransformerBlock(torch.nn.Module):
         self.input_tensor = input_tensor
 
     @torch.no_grad()
+    @instrument_nvtx
     def forward(
         self,
         hidden_states: Tensor,
